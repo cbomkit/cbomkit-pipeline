@@ -1,0 +1,280 @@
+#
+# CBOMkit-pipeline
+# Copyright (C) 2025 PQCA
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to you under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#      https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+ 
+trigger: none
+
+variables:
+  - name: serviceConnection
+    value: '<your-service-connection-name>'
+  - name: projectKey
+    value: '<your-project-key>'
+  - name: projectName
+    value: '<your-project-name>'
+  - name: cbomKitUrl
+    value: 'http://<your-CBOMKit-IP>:8081'
+
+jobs:
+# -----------------------------------------
+# JOB 1: Build & Analyze Project (Generate CBOM for project)
+# -----------------------------------------
+- job: Build_And_Analyze_Project
+  displayName: "Build Java Project + SonarQube Analysis + CBOM for the project"
+  timeoutInMinutes: 60
+  pool:
+    vmImage: "ubuntu-latest"
+  workspace:
+    clean: all
+
+  steps:
+  - checkout: self
+
+  - task: SonarQubePrepare@7
+    displayName: Prepare analysis for Java
+    
+    inputs:
+      SonarQube: '$(serviceConnection)'
+      scannerMode: 'other'
+      extraProperties: |
+        sonar.projectKey=$(projectKey)
+        sonar.projectName=$(projectName)
+
+  - task: JavaToolInstaller@0
+    
+    inputs:
+      versionSpec: '17'
+      jdkArchitectureOption: 'x64'
+      jdkSourceOption: 'PreInstalled'
+
+  - task: Maven@4
+    
+    inputs:
+      mavenPomFile: 'pom.xml'
+      publishJUnitResults: false
+      javaHomeOption: 'JDKVersion'
+      mavenVersionOption: 'Default'
+      mavenAuthenticateFeed: false
+      effectivePomSkip: false
+      sonarQubeRunAnalysis: true
+      sqMavenPluginVersionChoice: 'latest'
+
+  - task: PowerShell@2
+    displayName: 'add CBOM.json to Pipeline Summary and as variable'
+    inputs:
+      targetType: 'inline'
+      script: |
+        echo "building Path to cbom.json that was generated during build"
+        $systemDir = "$(System.DefaultWorkingDirectory)"
+        $cbomFile = Join-Path $systemDir "cbom.json"
+        Write-Host "##vso[task.setvariable variable=cbomFile;]$cbomFile"
+        Write-Host "##vso[task.uploadsummary]$cbomFile"
+    
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish CBOM of project as artifact'
+    inputs:
+      targetPath: '$(cbomFile)'
+      artifactName: 'PROJECT_CBOM'
+
+# -----------------------------------------
+# JOB 2: Generate SBOM and Extract PURLs
+# -----------------------------------------
+- job: Generate_SBOM
+  displayName: "Generate SBOM with cdxgen + Extract PURLs"
+  dependsOn: Build_And_Analyze_Project
+  pool:
+    vmImage: "ubuntu-latest"
+  workspace:
+    clean: all
+  steps:
+  - checkout: self
+
+  # Replace with any SBOM generation tool as needed
+  - script: |
+      npm install -g @cyclonedx/cdxgen
+      cdxgen -o $(Build.ArtifactStagingDirectory)/sbom.json
+    displayName: 'Generate SBOM with cdxgen'
+
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish SBOM'
+    inputs:
+      targetPath: '$(Build.ArtifactStagingDirectory)/sbom.json'
+      artifactName: 'CDX_SBOM'
+
+  - task: PowerShell@2
+    displayName: 'Publish SBOM to Extensions Tab'
+    inputs:
+      targetType: 'inline'
+      script: |
+        $sbomPath = "$(Build.ArtifactStagingDirectory)/sbom.json"
+        Write-Host "##vso[task.uploadsummary]$sbomPath"
+
+  - task: Bash@3
+    displayName: 'Extract unique PURLs from SBOM'
+    inputs:
+      targetType: 'inline'
+      script: |
+        python3 - << 'PY'
+        import json, os, sys, pathlib
+
+        sbom_path = os.getenv('SBOM_PATH')
+        out_path  = os.getenv('PURL_OUT')
+
+        if not pathlib.Path(sbom_path).is_file():
+            print(f"[error] SBOM not found: {sbom_path}", file=sys.stderr)
+            sys.exit(1)
+
+        with open(sbom_path, encoding='utf-8') as f:
+            data = json.load(f)
+
+        purls = sorted(
+            { comp.get("purl") for comp in data.get("components", []) if comp.get("purl") }
+        )
+
+        with open(out_path, "w", encoding="utf-8") as fout:
+            fout.write("\n".join(purls))
+
+        print(f"Extracted {len(purls)} unique PURLs")
+        print(f"##vso[task.setvariable variable=purlFile;]{out_path}")
+        PY
+    env:
+      SBOM_PATH: $(Build.ArtifactStagingDirectory)/sbom.json
+      PURL_OUT: $(Build.ArtifactStagingDirectory)/purls.txt
+
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish PURL list'
+    inputs:
+      targetPath: '$(Build.ArtifactStagingDirectory)/purls.txt'
+      artifactName: 'PURL_LIST'
+
+# -----------------------------------------
+# JOB 3: CBOMs for all dependencies via CBOMKit
+# -----------------------------------------
+- job: Generate_CBOMs_For_Dependencies
+  displayName: "Generate CBOMs for each PURL via CBOMKit"
+  dependsOn: Generate_SBOM
+  pool:
+    name: $(agentPool) #Internal agent with access to the Cbomkit Instance
+  workspace:
+    clean: all
+  steps:
+  - task: DownloadPipelineArtifact@2    
+    displayName: Download PURL list
+    inputs:
+      artifactName: 'PURL_LIST'
+      buildType: 'current'
+      targetPath: '$(Build.ArtifactStagingDirectory)/cdx'
+
+  - task: DownloadPipelineArtifact@2
+    displayName: 'Download PROJECT_CBOM artifact'
+    inputs:
+      artifactName: 'PROJECT_CBOM'
+      buildType: 'current'
+      targetPath: '$(Pipeline.Workspace)/PROJECT_CBOM'
+
+  - task: PowerShell@2
+    displayName: 'Test CBOMKit API Health (Windows)'
+    inputs:
+      targetType: 'inline'
+      script: |
+        try {
+          $uri = "$(cbomKitUrl)/api"
+          $headers = @{ "Accept" = "application/json" }
+
+          $response = Invoke-WebRequest -Uri $uri -Headers $headers -TimeoutSec 15 -UseBasicParsing
+          if ($response.StatusCode -ne 200) { throw "Unexpected HTTP status code: $($response.StatusCode)" }
+  
+          $json = $response.Content | ConvertFrom-Json
+          if ($json.status -ne "ok") { throw "CBOMKit API status is not OK: $($json.status)" }
+  
+          Write-Host "CBOMKit API is reachable and status is OK."
+        } catch {
+          Write-Error "Health check failed: $_"
+          exit 1
+        }
+  - task: PowerShell@2
+    displayName: 'Upload CBOM of project to CBOMKit (Windows Agent)'
+    inputs:
+      targetType: 'inline'
+      script: |
+        $cbomFilePath = "$(Pipeline.Workspace)/PROJECT_CBOM/cbom.json"
+        if (-Not (Test-Path $cbomFilePath)) {
+          Write-Error "CBOM file not found: $cbomFilePath"
+          exit 1
+        }
+
+        $projectNameEncoded = [uri]::EscapeDataString("$(projectName)")
+        $cbomJson = Get-Content $cbomFilePath -Raw -Encoding UTF8
+
+        $uri = "$(cbomKitUrl)/api/v1/cbom/$projectNameEncoded"
+        try {
+          $response = Invoke-RestMethod -Uri $uri -Method Post -ContentType "application/json" -Body $cbomJson
+          Write-Host "CBOM successfully uploaded to CBOMKit: $($response | ConvertTo-Json -Depth 3)"
+        } catch {
+          Write-Error "Failed to upload CBOM to CBOMKit: $_"
+          exit 1
+        }
+
+  - task: PowerShell@2
+    displayName: 'Trigger individual CBOM scans for each PURL'
+    inputs:
+      targetType: 'inline'
+      script: |
+        $purlFile = "$(Build.ArtifactStagingDirectory)\cdx\purls.txt"
+        $apiBase = "$(cbomKitUrl)/api/v1/cbom"
+        $scanApi = "$(cbomKitUrl)/api/v1/scan"
+
+        if (-Not (Test-Path $purlFile)) {
+          Write-Error "PURL file not found: $purlFile"
+          exit 1
+        }
+
+        Get-Content $purlFile | ForEach-Object {
+          $purl = $_.Trim()
+          if ([string]::IsNullOrWhiteSpace($purl)) { return }
+
+          $encodedPurl = [uri]::EscapeDataString($purl)
+          $checkUrl = "$apiBase/$encodedPurl"
+
+          try {
+            $response = Invoke-WebRequest -Uri $checkUrl -Method GET -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
+            if ($response.StatusCode -eq 200) {
+              Write-Host "CBOM already exists for PURL: $purl → skipping"
+              return
+            } else {
+              Write-Error ("Error querying CBOMKit for {0}: {1}" -f $purl, $_.Exception.Message)
+              return
+            }
+          } catch {
+            if ($_.Exception.Response.StatusCode.value__ -eq 404) {
+              Write-Host "CBOM does not exist for PURL: $purl → triggering scan"
+              $body = @{ scanUrl = $purl; depth = 10 } | ConvertTo-Json -Depth 3
+
+              try {
+                $result = Invoke-RestMethod -Uri $scanApi -Method POST -ContentType "application/json" -Body $body
+                Write-Host "Scan triggered. $($result | ConvertTo-Json -Depth 3)"
+              } catch {
+                Write-Error ("Failed to scan {0}: {1}" -f $purl, $_)
+              }
+
+              Start-Sleep -Seconds 10
+            } else {
+              Write-Error ("Error querying CBOMKit for {0}: {1}" -f $purl, $_)
+            }
+          }
+          
+        }
